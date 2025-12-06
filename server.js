@@ -39,12 +39,16 @@ const CITY_COORDS = [
 // 用 IP 查經緯度
 async function getLatLngFromIP(ip) {
   try {
-    // 使用 ipapi 免費服務（有速率限制，之後可換成自己偏好的服務）
+    // 本機開發時給預設
+    if (!ip || ip === "::1" || ip === "127.0.0.1") {
+      return { lat: 25.04, lng: 121.56 }; // 台北市
+    }
+
     const res = await axios.get(`https://ipapi.co/${ip}/json/`);
     return { lat: res.data.latitude, lng: res.data.longitude };
   } catch (e) {
     console.error("IP 定位失敗，改用台北市為預設:", e.message);
-    return { lat: 25.04, lng: 121.56 }; // fallback: 台北市
+    return { lat: 25.04, lng: 121.56 };
   }
 }
 
@@ -70,6 +74,10 @@ function findNearestCity(lat, lng) {
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+//Zeabur / 反向代理環境建議加上 trust proxy
+//有 proxy 的平台，req.ip 才會拿到正確的「使用者 IP」
+app.set("trust proxy", true); 
 
 /**
  * 取得指定縣市天氣預報
