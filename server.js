@@ -10,6 +10,14 @@ const PORT = process.env.PORT || 3000;
 const CWA_API_BASE_URL = "https://opendata.cwa.gov.tw/api";
 const CWA_API_KEY = process.env.CWA_API_KEY;
 
+// Render / 反向代理環境
+app.set("trust proxy", true);
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 // 台灣縣市座標（城市中心點）for IP 自動定位
 const CITY_COORDS = [
   { name: "臺北市", lat: 25.04, lng: 121.56 },
@@ -36,16 +44,37 @@ const CITY_COORDS = [
   { name: "連江縣", lat: 26.16, lng: 119.95 },
 ];
 
+// 取得使用者 IP
+function getClientIP(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) {
+    return forwarded.split(",")[0].trim();
+  }
+
+  const ip = req.ip || req.connection?.remoteAddress || "";
+  return ip.replace("::ffff:", "");
+}
+
 // 用 IP 查經緯度
 async function getLatLngFromIP(ip) {
   try {
-    // 本機開發時給預設
+    // 本機開發 / Render 偵錯 / 無法定位時給預設
     if (!ip || ip === "::1" || ip === "127.0.0.1") {
       return { lat: 25.04, lng: 121.56 }; // 台北市
     }
 
-    const res = await axios.get(`https://ipapi.co/${ip}/json/`);
-    return { lat: res.data.latitude, lng: res.data.longitude };
+    const res = await axios.get(`https://ipapi.co/${ip}/json/`, {
+      timeout: 5000,
+    });
+
+    if (!res.data || !res.data.latitude || !res.data.longitude) {
+      throw new Error("IP 定位服務未回傳座標");
+    }
+
+    return {
+      lat: Number(res.data.latitude),
+      lng: Number(res.data.longitude),
+    };
   } catch (e) {
     console.error("IP 定位失敗，改用台北市為預設:", e.message);
     return { lat: 25.04, lng: 121.56 };
@@ -61,6 +90,7 @@ function findNearestCity(lat, lng) {
     const dLat = lat - city.lat;
     const dLng = lng - city.lng;
     const dist = dLat * dLat + dLng * dLng;
+
     if (dist < bestDist) {
       bestDist = dist;
       bestCity = city;
@@ -70,38 +100,24 @@ function findNearestCity(lat, lng) {
   return bestCity.name;
 }
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-//Zeabur / 反向代理環境建議加上 trust proxy
-//有 proxy 的平台，req.ip 才會拿到正確的「使用者 IP」
-app.set("trust proxy", true); 
-
 /**
  * 取得指定縣市天氣預報
  * - 如果有 ?locationName=臺北市 → 用指定縣市
- * - 若未指定 locationName → 「自動定位」：用使用者 IP 推估最近縣市
+ * - 若未指定 locationName → 用使用者 IP 自動推估縣市
  */
-const getWeatherByLocation = async (req, res) => {
+async function getWeatherByLocation(req, res) {
   try {
     if (!CWA_API_KEY) {
       return res.status(500).json({
         error: "伺服器設定錯誤",
-        message: "請在 .env 檔案中設定 CWA_API_KEY",
+        message: "尚未設定 CWA_API_KEY",
       });
     }
 
-    // 1️⃣ 有指定就用指定，沒指定就自動定位
     let locationName = req.query.locationName;
 
     if (!locationName) {
-      const clientIP =
-        req.headers["x-forwarded-for"]?.split(",")[0] ||
-        req.connection?.remoteAddress ||
-        req.ip;
-
+      const clientIP = getClientIP(req);
       console.log("🌏 使用者 IP:", clientIP);
 
       const { lat, lng } = await getLatLngFromIP(clientIP);
@@ -111,7 +127,6 @@ const getWeatherByLocation = async (req, res) => {
       console.log("📍 自動偵測縣市:", locationName);
     }
 
-    // 2️⃣ 呼叫 CWA API - 一般天氣預報（36小時）
     const response = await axios.get(
       `${CWA_API_BASE_URL}/v1/rest/datastore/F-C0032-001`,
       {
@@ -119,10 +134,11 @@ const getWeatherByLocation = async (req, res) => {
           Authorization: CWA_API_KEY,
           locationName,
         },
+        timeout: 10000,
       }
     );
 
-    const locationData = response.data.records.location[0];
+    const locationData = response?.data?.records?.location?.[0];
 
     if (!locationData) {
       return res.status(404).json({
@@ -131,15 +147,14 @@ const getWeatherByLocation = async (req, res) => {
       });
     }
 
-    // 整理天氣資料給前端
     const weatherData = {
       city: locationData.locationName,
       updateTime: response.data.records.datasetDescription,
       forecasts: [],
     };
 
-    const weatherElements = locationData.weatherElement;
-    const timeCount = weatherElements[0].time.length;
+    const weatherElements = locationData.weatherElement || [];
+    const timeCount = weatherElements[0]?.time?.length || 0;
 
     for (let i = 0; i < timeCount; i++) {
       const forecast = {
@@ -154,16 +169,17 @@ const getWeatherByLocation = async (req, res) => {
       };
 
       weatherElements.forEach((element) => {
-        const value = element.time[i].parameter;
+        const value = element?.time?.[i]?.parameter;
+        if (!value) return;
+
         switch (element.elementName) {
           case "Wx":
             forecast.weather = value.parameterName;
             break;
           case "PoP":
-            forecast.rain = value.parameterName + "%";
+            forecast.rain = `${value.parameterName}%`;
             break;
           case "MinT":
-            // 只給數字，例如 "24"；前端要加 "°" 自己加
             forecast.minTemp = value.parameterName;
             break;
           case "MaxT":
@@ -181,7 +197,7 @@ const getWeatherByLocation = async (req, res) => {
       weatherData.forecasts.push(forecast);
     }
 
-    res.json({
+    return res.json({
       success: true,
       data: weatherData,
     });
@@ -191,17 +207,17 @@ const getWeatherByLocation = async (req, res) => {
     if (error.response) {
       return res.status(error.response.status).json({
         error: "CWA API 錯誤",
-        message: error.response.data.message || "無法取得天氣資料",
+        message: error.response.data?.message || "無法取得天氣資料",
         details: error.response.data,
       });
     }
 
-    res.status(500).json({
+    return res.status(500).json({
       error: "伺服器錯誤",
       message: "無法取得天氣資料，請稍後再試",
     });
   }
-};
+}
 
 // Routes
 app.get("/", (req, res) => {
@@ -216,24 +232,26 @@ app.get("/", (req, res) => {
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "OK", timestamp: new Date().toISOString() });
+  res.json({
+    status: "OK",
+    timestamp: new Date().toISOString(),
+    env: process.env.NODE_ENV || "development",
+  });
 });
 
-// ✅ 新版天氣 API：locationName 可選，未指定就自動定位
 app.get("/api/weather", getWeatherByLocation);
 
-// ✅ 舊路徑相容：/api/weather/kaohsiung 仍可用（固定高雄）
-app.get("/api/weather/kaohsiung", (req, res, next) => {
+app.get("/api/weather/kaohsiung", (req, res) => {
   req.query.locationName = "高雄市";
-  return getWeatherByLocation(req, res, next);
+  return getWeatherByLocation(req, res);
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error(err.stack);
+  console.error("未處理錯誤:", err.stack);
   res.status(500).json({
     error: "伺服器錯誤",
-    message: err.message,
+    message: err.message || "未知錯誤",
   });
 });
 
@@ -245,6 +263,6 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 伺服器運行已運作，Port: ${PORT}`);
+  console.log(`🚀 伺服器已啟動，Port: ${PORT}`);
   console.log(`📍 環境: ${process.env.NODE_ENV || "development"}`);
 });
